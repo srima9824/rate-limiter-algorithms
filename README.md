@@ -417,7 +417,31 @@ Responsible for
 Each class owns a single responsibility.
 
 ---
+## Unit Testing
 
+Unit tests are written using `pytest` to verify the core behavior of the rate limiter independently of the FastAPI application.
+
+The tests currently cover:
+
+- Valid and invalid `TokenBucket` configuration.
+- Valid and invalid `RateLimiter` configuration.
+- Request key and token validation.
+- Initial bucket capacity and token consumption.
+- Reuse of the same bucket for repeated requests from the same client.
+- Request rejection when sufficient tokens are unavailable.
+- `retry_after` calculation when a request is rate limited.
+- Lazy token refill after elapsed time.
+
+Time-dependent tests use `pytest`'s `monkeypatch` to control `time.time()` rather than relying on `time.sleep()`. This keeps the tests deterministic and avoids unnecessary delays.
+
+Tests are organized by component:
+
+```text
+tests/
+├── test_token_bucket.py
+└── test_rate_limiter.py
+```
+---
 # Best Practices Used
 
 - Encapsulation
