@@ -16,7 +16,7 @@ While building this project, the objective was different:
 - Apply Object Oriented Design principles.
 - Handle concurrent requests safely.
 - Keep the implementation configurable.
-- Think about production concerns such as memory cleanup, logging, graceful degradation and middleware integration.
+- Think about production concerns such as memory cleanup, logging, graceful degradation, exception handling and middleware integration.
 - Understand **why** every design decision was made instead of simply writing code that works.
 
 ---
@@ -60,28 +60,41 @@ token-bucket/
                 Client
                    │
                    ▼
-         FastAPI Middleware
+           FastAPI Middleware
                    │
                    ▼
-      Extract Client Identifier
+        Extract Client Identifier
                    │
                    ▼
-      RateLimiter.allow_request()
+        RateLimiter.allow_request()
                    │
                    ▼
-          Get/Create Bucket
-                   │
+    Get/Create Bucket (_get_bucket())
+            |
+            ├── Acquire RateLimiter Lock
+            │
+            ├── Lookup/Create Bucket
+            │
+            └── Release RateLimiter Lock
+                    ▼
+    TokenBucket (bucket.consume())
+            │
+            ├── Acquire Bucket Lock
+            │
+            ├── _refill()
+            │
+            ├── Check remaining tokens
+            │
+            ├── Consume token (if allowed)
+            │
+            ├── Calculate retry_after
+            │
+            ├── Return (allowed, remaining, retry_after)
+            │
+            └── Release Bucket Lock
+                   |
                    ▼
-      TokenBucket.consume()
-                   │
-         Acquire Bucket Lock
-                   │
-              Lazy Refill
-                   │
-          Consume Token
-                   │
-                   ▼
-    (Allowed?, Remaining?, RetryAfter?)
+    Return (Allowed?, Remaining?, RetryAfter?)
                    │
                    ▼
           Middleware Response
@@ -91,138 +104,89 @@ token-bucket/
                    ▼
                 Client
 ```
-
----
-
-# Request Flow
-
-Every incoming request follows the following sequence:
-
-1. Middleware intercepts the request.
-2. Client identifier is extracted.
-3. RateLimiter fetches (or creates) a TokenBucket.
-4. Bucket synchronizes itself using Lazy Refill.
-5. Bucket decides whether request can proceed.
-6. Middleware either
-
-   - returns **429 Too Many Requests**
-
-   OR
-
-   - forwards request to FastAPI endpoint.
-
-7. Response headers are added.
-8. Response is returned.
-
 ---
 
 # Token Bucket Algorithm
 
-Every client owns an independent bucket.
+Every client owns an independent bucket. For this project we maintain an in memory cache of the form { 'ip': 'TokenBucket' }
+
+Each bucket maintains:
+
+- Maximum Capacity (`max_tokens`): Maximum amount of tokens allowed in the bucket
+- Current Tokens (`current_tokens`): Remaining amount of tokens in the bucket
+- Refill Rate (`refill_rate`): At rate (tokens/second) the bucket should be refilled 
+- Last Refill Timestamp (`last_refill_time`): What was the last time when bucket was refilled
+
+For the sake of simplicity, each request consumes 1 token. 
+
+For every incoming request, the following algorithm is executed:
+
+### Step 1: Locate Bucket
+- Fetch the client's bucket.
+- If it does not exist, create a new bucket with `max_tokens`.
+
+### Step 2: Lazy Refill
+- Calculate the elapsed time since the previous refill.
+- Compute the number of tokens to add.
 
 ```
-Maximum Capacity = 10 Tokens
-
-Current Tokens = 10
+tokens_to_add = elapsed_time × refill_rate
 ```
 
-Each request consumes one token.
+- Update the bucket.
 
 ```
-10
-
-↓
-
-9
-
-↓
-
-8
-
-↓
-
-...
+current_tokens = min(max_tokens,
+                     current_tokens + tokens_to_add)
 ```
 
-Once the bucket becomes empty,
+- Update `last_refill_time`.
+
+### Step 3: Check Capacity
+
+If
 
 ```
-Current Tokens = 0
+current_tokens >= tokens_requested
 ```
 
-future requests are rejected until enough tokens have been regenerated.
+- Consume the requested tokens.
+- Allow the request.
 
----
+Otherwise,
 
-# Lazy Refill
-
-Instead of continuously adding tokens every second,
-
-tokens are regenerated **only when a request arrives.**
-
-Example:
+- Reject the request.
+- Calculate
 
 ```
-Refill Rate = 2 tokens/sec
-
-User waits 5 seconds
-
-↓
-
-Next Request
-
-↓
-
-Tokens Added = 10
+retry_after = (tokens_requested - current_tokens)
+              / refill_rate
 ```
 
-This avoids running unnecessary background refill jobs.
+- Return the time after which the request can be retried.
 
+### Step 4: Return Result
+
+The bucket returns a single atomic response containing:
+
+- Whether the request was allowed.
+- Remaining tokens after processing.
+- Retry-After duration (if rejected).
 ---
 
 # Why Lazy Refill?
 
-Two possible approaches were considered.
+Two possible approaches were considered before implementing the Token Bucket algorithm.
 
-## Approach 1
-
-Continuously refill every bucket every second.
-
-Pros
-
-- Easy to understand.
-
-Cons
-
-- Requires a scheduler.
-- Wastes CPU even when nobody is using the API.
-- Does not scale well.
-
----
-
-## Approach 2 (Chosen)
-
-Calculate elapsed time only when a request arrives.
-
-```
-Tokens Added
-
-=
-
-Elapsed Time
-
-×
-
-Refill Rate
-```
-
-Advantages
-
-- O(1)
-- No scheduler
-- Scales much better
-
----
+| Aspect | Periodic Refill | Lazy Refill (Chosen) |
+|--------|-----------------|----------------------|
+| **How it works** | Refill every bucket at fixed intervals (e.g. every second). | Refill a bucket only when a request arrives. |
+| **Scheduler Required?** | ✅ Yes | ❌ No |
+| **CPU Usage** | Keeps running even when there are no requests. | Performs work only when required. |
+| **Scalability** | Poor for a large number of buckets. | Scales well since work is proportional to incoming traffic. |
+| **Implementation Complexity** | Requires background scheduling. | Simpler implementation. |
+| **Time Complexity / Request** | O(1) refill + scheduler overhead. | O(1) |
+| **Chosen?** | ❌ No | ✅ Yes |
 
 # Fractional Tokens
 
@@ -250,39 +214,25 @@ Bucket contains
 1.5 Tokens
 ```
 
-Although internally fractional values are stored,
-
-every API request consumes **whole tokens only.**
-
-This keeps the refill accurate while keeping API cost intuitive.
+Although internally fractional values are stored, every API request consumes **whole tokens only.** This keeps the refill accurate while keeping API cost intuitive.
 
 ---
 
 # Thread Safety
 
-Multiple users may hit the server simultaneously.
-
-Without synchronization,
-
-two requests may both read
+Multiple users may hit the server simultaneously. Without synchronization, two requests may both read
 
 ```
 Current Tokens = 1
 ```
 
-Both succeed.
-
-Bucket becomes
+Both succeed. Bucket becomes
 
 ```
 -1 Tokens
 ```
 
-which is incorrect.
-
-To avoid race conditions,
-
-every TokenBucket owns its own lock.
+which is incorrect. To avoid race conditions, every TokenBucket owns its own lock.
 
 ```
 Bucket A
@@ -298,9 +248,7 @@ Bucket C
 🔒
 ```
 
-Requests belonging to different users proceed concurrently.
-
-Only requests targeting the same bucket wait.
+Requests belonging to different users proceed concurrently. Only requests targeting the same bucket wait.
 
 ---
 
@@ -325,9 +273,7 @@ These are two completely different shared resources.
 
 # Atomicity
 
-Originally,
-
-remaining tokens were retrieved using
+Originally, remaining tokens were retrieved using
 
 ```
 consume()
@@ -337,24 +283,12 @@ consume()
 get_remaining_tokens()
 ```
 
-This introduced a race condition.
-
-Another thread could modify the bucket before remaining tokens were read.
-
-The implementation was changed to return
+This introduced a race condition. Another thread could modify the bucket before remaining tokens were read. The implementation was changed to return
 
 ```
-Allowed?
+(Allowed? , Remaining Tokens, Retry After)
 
-Remaining Tokens
-
-Retry After
-```
-
-directly from
-
-```
-consume()
+directly from consume()
 ```
 
 ensuring the entire operation happens under a single lock.
@@ -363,25 +297,13 @@ ensuring the entire operation happens under a single lock.
 
 # Retry-After
 
-When a request cannot be served,
-
-the server calculates
+When a request cannot be served, the server calculates
 
 ```
-Retry After
-
-=
-
-Tokens Needed
-
-/
-
-Refill Rate
+Retry After = Tokens Needed / Refill Rate
 ```
 
-instead of returning an arbitrary delay.
-
-This tells the client exactly when another request is likely to succeed.
+instead of returning an arbitrary delay. This tells the client exactly when another request is likely to succeed.
 
 ---
 
@@ -407,9 +329,7 @@ Every bucket stores
 Last Refill Time
 ```
 
-Since every request triggers a refill,
-
-this timestamp also acts as the bucket's last activity timestamp.
+Since every request triggers a refill, this timestamp also acts as the bucket's last activity timestamp. 
 
 A daemon thread periodically removes buckets that have remained inactive beyond a configurable duration.
 
@@ -449,9 +369,7 @@ This avoids hardcoded values and allows different deployments to use different l
 
 The middleware follows a **Fail Open** strategy.
 
-If the rate limiter itself encounters an unexpected error,
-
-the request is still forwarded to the application.
+If the rate limiter itself encounters an unexpected error, the request is still forwarded to the application.
 
 Reason
 
@@ -524,8 +442,6 @@ Each class owns a single responsibility.
 - Redis-backed distributed rate limiting
 - Multiple rate limiting algorithms
 - Sliding Window Counter
-- Sliding Window Log
-- Fixed Window
 - Leaky Bucket
 - Different rate limits for premium users
 - Different token cost per endpoint
