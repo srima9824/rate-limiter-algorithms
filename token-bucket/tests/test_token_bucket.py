@@ -11,7 +11,7 @@ def test_new_bucket_starts_with_max_tokens():
 
     assert bucket.consume(1)[0] is False
 
-# We want to verify that incorrect values raise value errors
+# We want to verify that inputs values raise value errors
 def test_max_tokens_must_be_positive():
     with pytest.raises(ValueError):
         TokenBucket(max_tokens=-2, refill_rate=2)
@@ -22,7 +22,7 @@ def test_refill_rate_must_be_positive():
     with pytest.raises(ValueError):
         TokenBucket(max_tokens=5, refill_rate=0)
     with pytest.raises(ValueError):
-        TokenBucket(max_tokens=0, refill_rate=-9)
+        TokenBucket(max_tokens=5, refill_rate=-9)
 
 # Does consuming a token actually reduce the bucket correctly
 def test_consuming_token_reduces_remaining_tokens():

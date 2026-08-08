@@ -9,6 +9,11 @@ class RateLimiter:
             refill_rate: float, 
             cleanup_interval: int = 300, 
             expiry_seconds: int = 1800):
+
+        if max_tokens <= 0:
+            raise ValueError("Max Tokens must be positive.")
+        if refill_rate <= 0:
+            raise ValueError("Refill Rate must be positive.")
         
         self._max_tokens = max_tokens 
         self._refill_rate = refill_rate
